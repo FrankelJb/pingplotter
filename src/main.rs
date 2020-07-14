@@ -6,6 +6,7 @@ use crate::util::{
     SinSignal,
 };
 use regex::Regex;
+use std::sync::{Arc, Mutex};
 use std::{error::Error, io, process::Command};
 use termion::{event::Key, input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen};
 use tui::{
@@ -18,50 +19,37 @@ use tui::{
 };
 
 struct App {
-    signal1: SinSignal,
-    data1: Vec<(f64, f64)>,
-    signal2: SinSignal,
-    data2: Vec<(f64, f64)>,
-    window: [f64; 2],
+    ping_times: Vec<(f64, f64)>,
+    window: (f64, f64),
+    current_x: f64,
 }
 
 impl App {
     fn new() -> App {
-        let mut signal1 = SinSignal::new(0.2, 3.0, 18.0);
-        let mut signal2 = SinSignal::new(0.1, 2.0, 10.0);
-        let data1 = signal1.by_ref().take(200).collect::<Vec<(f64, f64)>>();
-        let data2 = signal2.by_ref().take(200).collect::<Vec<(f64, f64)>>();
         App {
-            signal1,
-            data1,
-            signal2,
-            data2,
-            window: [0.0, 20.0],
+            ping_times: Vec::new(),
+            window: (0.0, 100.0),
+            current_x: 0.0,
         }
     }
 
-    fn update(&mut self) {
-        for _ in 0..5 {
-            self.data1.remove(0);
+    fn append_time(&mut self, time: f64) {
+        self.ping_times.push((self.current_x, time));
+        self.current_x += 1.0;
+        if self.current_x > self.window.1 {
+            self.ping_times.remove(0);
+            self.window.0 += 1.0;
+            self.window.1 += 1.0;
         }
-        self.data1.extend(self.signal1.by_ref().take(5));
-        for _ in 0..10 {
-            self.data2.remove(0);
-        }
-        self.data2.extend(self.signal2.by_ref().take(10));
-        self.window[0] += 1.0;
-        self.window[1] += 1.0;
     }
 }
+
+const PING_PATH: &'static str = "/bin/ping";
 
 fn ping(addr: &str) -> Result<f64, Box<dyn Error>> {
     // TODO: Should we support windows?
     // TODO: where is ping
-    let output = Command::new("/usr/bin/ping")
-        .arg("-c1")
-        .arg(addr)
-        .output()?;
-    println!("{:?}", addr);
+    let output = Command::new(PING_PATH).arg("-c1").arg(addr).output()?;
     if output.status.success() {
         let text = std::str::from_utf8(&output.stdout).unwrap();
         let time_regex = Regex::new(r".*time=(\d+\.\d+).*")?;
@@ -78,7 +66,7 @@ fn ping(addr: &str) -> Result<f64, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("{:?}", ping("8.8.8.8"));
+    // println!("{:?}", ping("8.8.8.8"));
     // panic!("at the disco");
 
     // Terminal initialization
@@ -92,43 +80,40 @@ fn main() -> Result<(), Box<dyn Error>> {
     let events = Events::new();
 
     // App
-    let mut app = App::new();
+    let app = Arc::new(Mutex::new(App::new()));
+
+    let app_ref = Arc::clone(&app);
+
+    std::thread::spawn(move || loop {
+        if let Ok(time) = ping("8.8.8.8" /*"45.220.23.181"*/) {
+            app_ref.lock().unwrap().append_time(time);
+        }
+    });
 
     loop {
         terminal.draw(|mut f| {
+            // let data = Arc::clone(&app);
+            let mut app = app.lock().unwrap();
             let size = f.size();
             let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(
-                    [
-                        Constraint::Ratio(1, 3),
-                        Constraint::Ratio(1, 3),
-                        Constraint::Ratio(1, 3),
-                    ]
-                    .as_ref(),
-                )
+                .constraints([Constraint::Percentage(100)].as_ref())
                 .split(size);
+            // println!("{:?}", chunks);
             let x_labels = [
-                format!("{}", app.window[0]),
-                format!("{}", (app.window[0] + app.window[1]) / 2.0),
-                format!("{}", app.window[1]),
+                format!("{}", app.window.0),
+                format!("{}", (app.window.0 + app.window.1) / 2.0),
+                format!("{}", app.window.1),
             ];
-            let datasets = [
-                Dataset::default()
-                    .name("data2")
-                    .marker(symbols::Marker::Dot)
-                    .style(Style::default().fg(Color::Cyan))
-                    .data(&app.data1),
-                Dataset::default()
-                    .name("data3")
-                    .marker(symbols::Marker::Braille)
-                    .style(Style::default().fg(Color::Yellow))
-                    .data(&app.data2),
-            ];
+            let datasets = [Dataset::default()
+                .name("ping_times")
+                .marker(symbols::Marker::Dot)
+                .style(Style::default().fg(Color::Yellow))
+                .graph_type(GraphType::Line)
+                .data(&app.ping_times)];
             let chart = Chart::default()
                 .block(
                     Block::default()
-                        .title("Chart 1")
+                        .title("Ping Time")
                         .title_style(Style::default().fg(Color::Cyan).modifier(Modifier::BOLD))
                         .borders(Borders::ALL),
                 )
@@ -137,7 +122,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .title("X Axis")
                         .style(Style::default().fg(Color::Gray))
                         .labels_style(Style::default().modifier(Modifier::ITALIC))
-                        .bounds(app.window)
+                        .bounds([app.window.0, app.window.1])
                         .labels(&x_labels),
                 )
                 .y_axis(
@@ -145,8 +130,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .title("Y Axis")
                         .style(Style::default().fg(Color::Gray))
                         .labels_style(Style::default().modifier(Modifier::ITALIC))
-                        .bounds([-20.0, 20.0])
-                        .labels(&["-20", "0", "20"]),
+                        .bounds([0.0, 1000.0])
+                        .labels(&["0", "1000"]),
                 )
                 .datasets(&datasets);
             f.render_widget(chart, chunks[0]);
@@ -158,9 +143,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     break;
                 }
             }
-            Event::Tick => {
-                app.update();
-            }
+            Event::Tick => {}
         }
     }
 
